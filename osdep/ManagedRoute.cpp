@@ -100,7 +100,8 @@ struct _RTE
 	bool ifscope;
 };
 
-#ifdef __BSD__ // ------------------------------------------------------------
+//#if defined (__BSD__) || defined (__SMARTOS__) // ------------------------------------------------------------
+#if defined (__BSD__)  // ------------------------------------------------------------
 #define ZT_ROUTING_SUPPORT_FOUND 1
 
 static std::vector<_RTE> _getRTEs(const InetAddress &target,bool contains)
@@ -267,7 +268,7 @@ static void _routeCmd(const char *op,const InetAddress &target,const InetAddress
 
 #endif // __BSD__ ------------------------------------------------------------
 
-#ifdef __LINUX__ // ----------------------------------------------------------
+#if defined (__LINUX__) || defined (__SMARTOS__)
 #define ZT_ROUTING_SUPPORT_FOUND 1
 
 static void _routeCmd(const char *op,const InetAddress &target,const InetAddress &via,const char *localInterface)
