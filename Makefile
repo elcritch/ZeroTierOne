@@ -17,5 +17,6 @@ ifeq ($(OSTYPE),OpenBSD)
 	include make-freebsd.mk
 endif
 ifeq ($(OSTYPE),SunOS)
+	CFLAGS+=-std=c++11 -D__UNIX_LIKE__ -D__SUNOS__
 	include make-freebsd.mk
 endif
