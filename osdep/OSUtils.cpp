@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 
 #include "../node/Constants.hpp"
+#include "../node/Utils.hpp"
 
 #ifdef __UNIX_LIKE__
 #include <unistd.h>
@@ -393,6 +394,81 @@ std::string OSUtils::platformDefaultHomePath()
 #endif
 
 #endif // __UNIX_LIKE__ or not...
+}
+
+// Inline these massive JSON operations in one place only to reduce binary footprint and compile time
+nlohmann::json OSUtils::jsonParse(const std::string &buf) { return nlohmann::json::parse(buf); }
+std::string OSUtils::jsonDump(const nlohmann::json &j) { return j.dump(2); }
+
+uint64_t OSUtils::jsonInt(const nlohmann::json &jv,const uint64_t dfl)
+{
+	try {
+		if (jv.is_number()) {
+			return (uint64_t)jv;
+		} else if (jv.is_string()) {
+			std::string s = jv;
+			return Utils::strToU64(s.c_str());
+		} else if (jv.is_boolean()) {
+			return ((bool)jv ? 1ULL : 0ULL);
+		}
+	} catch ( ... ) {}
+	return dfl;
+}
+
+bool OSUtils::jsonBool(const nlohmann::json &jv,const bool dfl)
+{
+	try {
+		if (jv.is_boolean()) {
+			return (bool)jv;
+		} else if (jv.is_number()) {
+			return ((uint64_t)jv > 0ULL);
+		} else if (jv.is_string()) {
+			std::string s = jv;
+			if (s.length() > 0) {
+				switch(s[0]) {
+					case 't':
+					case 'T':
+					case '1':
+						return true;
+				}
+			}
+			return false;
+		}
+	} catch ( ... ) {}
+	return dfl;
+}
+
+std::string OSUtils::jsonString(const nlohmann::json &jv,const char *dfl)
+{
+	try {
+		if (jv.is_string()) {
+			return jv;
+		} else if (jv.is_number()) {
+			char tmp[64];
+			Utils::snprintf(tmp,sizeof(tmp),"%llu",(uint64_t)jv);
+			return tmp;
+		} else if (jv.is_boolean()) {
+			return ((bool)jv ? std::string("1") : std::string("0"));
+		}
+	} catch ( ... ) {}
+	return std::string((dfl) ? dfl : "");
+}
+
+std::string OSUtils::jsonBinFromHex(const nlohmann::json &jv)
+{
+	std::string s(jsonString(jv,""));
+	if (s.length() > 0) {
+		char *buf = new char[(s.length() / 2) + 1];
+		try {
+			unsigned int l = Utils::unhex(s,buf,(unsigned int)s.length());
+			std::string b(buf,l);
+			delete [] buf;
+			return b;
+		} catch ( ... ) {
+			delete [] buf;
+		}
+	}
+	return std::string();
 }
 
 // Used to convert HTTP header names to ASCII lower case

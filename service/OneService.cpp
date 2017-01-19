@@ -52,6 +52,7 @@
 #include "ControlPlane.hpp"
 #include "ClusterGeoIpService.hpp"
 #include "ClusterDefinition.hpp"
+#include "SoftwareUpdater.hpp"
 
 #ifdef ZT_USE_SYSTEM_HTTP_PARSER
 #include <http_parser.h>
@@ -147,261 +148,6 @@ namespace ZeroTier { typedef BSDEthernetTap EthernetTap; }
 namespace ZeroTier {
 
 namespace {
-
-static uint64_t _jI(const json &jv,const uint64_t dfl)
-{
-	if (jv.is_number()) {
-		return (uint64_t)jv;
-	} else if (jv.is_string()) {
-		std::string s = jv;
-		return Utils::strToU64(s.c_str());
-	} else if (jv.is_boolean()) {
-		return ((bool)jv ? 1ULL : 0ULL);
-	}
-	return dfl;
-}
-static bool _jB(const json &jv,const bool dfl)
-{
-	if (jv.is_boolean()) {
-		return (bool)jv;
-	} else if (jv.is_number()) {
-		return ((uint64_t)jv > 0ULL);
-	} else if (jv.is_string()) {
-		std::string s = jv;
-		if (s.length() > 0) {
-			switch(s[0]) {
-				case 't':
-				case 'T':
-				case '1':
-					return true;
-			}
-		}
-		return false;
-	}
-	return dfl;
-}
-static std::string _jS(const json &jv,const char *dfl)
-{
-	if (jv.is_string()) {
-		return jv;
-	} else if (jv.is_number()) {
-		char tmp[64];
-		Utils::snprintf(tmp,sizeof(tmp),"%llu",(uint64_t)jv);
-		return tmp;
-	} else if (jv.is_boolean()) {
-		return ((bool)jv ? std::string("1") : std::string("0"));
-	}
-	return std::string((dfl) ? dfl : "");
-}
-
-#ifdef ZT_AUTO_UPDATE
-#define ZT_AUTO_UPDATE_MAX_HTTP_RESPONSE_SIZE (1024 * 1024 * 64)
-#define ZT_AUTO_UPDATE_CHECK_PERIOD 21600000
-class BackgroundSoftwareUpdateChecker
-{
-public:
-	bool isValidSigningIdentity(const Identity &id)
-	{
-		return (
-			/* 0001 - 0004 : obsolete, used in old versions */
-		  /* 0005 */   (id == Identity("ba57ea350e:0:9d4be6d7f86c5660d5ee1951a3d759aa6e12a84fc0c0b74639500f1dbc1a8c566622e7d1c531967ebceb1e9d1761342f88324a8ba520c93c35f92f35080fa23f"))
-		  /* 0006 */ ||(id == Identity("5067b21b83:0:8af477730f5055c48135b84bed6720a35bca4c0e34be4060a4c636288b1ec22217eb22709d610c66ed464c643130c51411bbb0294eef12fbe8ecc1a1e2c63a7a"))
-		  /* 0007 */ ||(id == Identity("4f5e97a8f1:0:57880d056d7baeb04bbc057d6f16e6cb41388570e87f01492fce882485f65a798648595610a3ad49885604e7fb1db2dd3c2c534b75e42c3c0b110ad07b4bb138"))
-		  /* 0008 */ ||(id == Identity("580bbb8e15:0:ad5ef31155bebc6bc413991992387e083fed26d699997ef76e7c947781edd47d1997161fa56ba337b1a2b44b129fd7c7197ce5185382f06011bc88d1363b4ddd"))
-		);
-	}
-
-	void doUpdateCheck()
-	{
-		std::string url(OneService::autoUpdateUrl());
-		if ((url.length() <= 7)||(url.substr(0,7) != "http://"))
-			return;
-
-		std::string httpHost;
-		std::string httpPath;
-		{
-			std::size_t slashIdx = url.substr(7).find_first_of('/');
-			if (slashIdx == std::string::npos) {
-				httpHost = url.substr(7);
-				httpPath = "/";
-			} else {
-				httpHost = url.substr(7,slashIdx);
-				httpPath = url.substr(slashIdx + 7);
-			}
-		}
-		if (httpHost.length() == 0)
-			return;
-
-		std::vector<InetAddress> ips(OSUtils::resolve(httpHost.c_str()));
-		for(std::vector<InetAddress>::iterator ip(ips.begin());ip!=ips.end();++ip) {
-			if (!ip->port())
-				ip->setPort(80);
-			std::string nfoPath = httpPath + "LATEST.nfo";
-			std::map<std::string,std::string> requestHeaders,responseHeaders;
-			std::string body;
-			requestHeaders["Host"] = httpHost;
-			unsigned int scode = Http::GET(ZT_AUTO_UPDATE_MAX_HTTP_RESPONSE_SIZE,60000,reinterpret_cast<const struct sockaddr *>(&(*ip)),nfoPath.c_str(),requestHeaders,responseHeaders,body);
-			//fprintf(stderr,"UPDATE %s %s %u %lu\n",ip->toString().c_str(),nfoPath.c_str(),scode,body.length());
-			if ((scode == 200)&&(body.length() > 0)) {
-				/* NFO fields:
-				 *
-				 * file=<filename>
-				 * signedBy=<signing identity>
-				 * ed25519=<ed25519 ECC signature of archive in hex>
-				 * vMajor=<major version>
-				 * vMinor=<minor version>
-				 * vRevision=<revision> */
-				Dictionary<4096> nfo(body.c_str());
-				char tmp[2048];
-
-				if (nfo.get("vMajor",tmp,sizeof(tmp)) <= 0) return;
-				const unsigned int vMajor = Utils::strToUInt(tmp);
-				if (nfo.get("vMinor",tmp,sizeof(tmp)) <= 0) return;
-				const unsigned int vMinor = Utils::strToUInt(tmp);
-				if (nfo.get("vRevision",tmp,sizeof(tmp)) <= 0) return;
-				const unsigned int vRevision = Utils::strToUInt(tmp);
-				if (Utils::compareVersion(vMajor,vMinor,vRevision,ZEROTIER_ONE_VERSION_MAJOR,ZEROTIER_ONE_VERSION_MINOR,ZEROTIER_ONE_VERSION_REVISION) <= 0) {
-					//fprintf(stderr,"UPDATE %u.%u.%u is not newer than our version\n",vMajor,vMinor,vRevision);
-					return;
-				}
-
-				if (nfo.get("signedBy",tmp,sizeof(tmp)) <= 0) return;
-				Identity signedBy;
-				if ((!signedBy.fromString(tmp))||(!isValidSigningIdentity(signedBy))) {
-					//fprintf(stderr,"UPDATE invalid signedBy or not authorized signing identity.\n");
-					return;
-				}
-
-				if (nfo.get("file",tmp,sizeof(tmp)) <= 0) return;
-				std::string filePath(tmp);
-				if ((!filePath.length())||(filePath.find("..") != std::string::npos))
-					return;
-				filePath = httpPath + filePath;
-
-				std::string fileData;
-				if (Http::GET(ZT_AUTO_UPDATE_MAX_HTTP_RESPONSE_SIZE,60000,reinterpret_cast<const struct sockaddr *>(&(*ip)),filePath.c_str(),requestHeaders,responseHeaders,fileData) != 200) {
-					//fprintf(stderr,"UPDATE GET %s failed\n",filePath.c_str());
-					return;
-				}
-
-				if (nfo.get("ed25519",tmp,sizeof(tmp)) <= 0) return;
-				std::string ed25519(Utils::unhex(tmp));
-				if ((ed25519.length() == 0)||(!signedBy.verify(fileData.data(),(unsigned int)fileData.length(),ed25519.data(),(unsigned int)ed25519.length()))) {
-					//fprintf(stderr,"UPDATE %s failed signature check!\n",filePath.c_str());
-					return;
-				}
-
-				/* --------------------------------------------------------------- */
-				/* We made it! Begin OS-specific installation code. */
-
-#ifdef __APPLE__
-				/* OSX version is in the form of a MacOSX .pkg file, so we will
-				 * launch installer (normally in /usr/sbin) to install it. It will
-				 * then turn around and shut down the service, update files, and
-				 * relaunch. */
-				{
-					char bashp[128],pkgp[128];
-					Utils::snprintf(bashp,sizeof(bashp),"/tmp/ZeroTierOne-update-%u.%u.%u.sh",vMajor,vMinor,vRevision);
-					Utils::snprintf(pkgp,sizeof(pkgp),"/tmp/ZeroTierOne-update-%u.%u.%u.pkg",vMajor,vMinor,vRevision);
-					FILE *pkg = fopen(pkgp,"w");
-					if ((!pkg)||(fwrite(fileData.data(),fileData.length(),1,pkg) != 1)) {
-						fclose(pkg);
-						unlink(bashp);
-						unlink(pkgp);
-						fprintf(stderr,"UPDATE error writing %s\n",pkgp);
-						return;
-					}
-					fclose(pkg);
-					FILE *bash = fopen(bashp,"w");
-					if (!bash) {
-						fclose(pkg);
-						unlink(bashp);
-						unlink(pkgp);
-						fprintf(stderr,"UPDATE error writing %s\n",bashp);
-						return;
-					}
-					fprintf(bash,
-						"#!/bin/bash\n"
-						"export PATH=/bin:/usr/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin\n"
-						"sleep 1\n"
-						"installer -pkg \"%s\" -target /\n"
-						"sleep 1\n"
-						"rm -f \"%s\" \"%s\"\n"
-						"exit 0\n",
-						pkgp,
-						pkgp,
-						bashp);
-					fclose(bash);
-					long pid = (long)vfork();
-					if (pid == 0) {
-						setsid(); // detach from parent so that shell isn't killed when parent is killed
-						signal(SIGHUP,SIG_IGN);
-						signal(SIGTERM,SIG_IGN);
-						signal(SIGQUIT,SIG_IGN);
-						execl("/bin/bash","/bin/bash",bashp,(char *)0);
-						exit(0);
-					}
-				}
-#endif // __APPLE__
-
-#ifdef __WINDOWS__
-				/* Windows version comes in the form of .MSI package that
-				 * takes care of everything. */
-				{
-					char tempp[512],batp[512],msip[512],cmdline[512];
-					if (GetTempPathA(sizeof(tempp),tempp) <= 0)
-						return;
-					CreateDirectoryA(tempp,(LPSECURITY_ATTRIBUTES)0);
-					Utils::snprintf(batp,sizeof(batp),"%s\\ZeroTierOne-update-%u.%u.%u.bat",tempp,vMajor,vMinor,vRevision);
-					Utils::snprintf(msip,sizeof(msip),"%s\\ZeroTierOne-update-%u.%u.%u.msi",tempp,vMajor,vMinor,vRevision);
-					FILE *msi = fopen(msip,"wb");
-					if ((!msi)||(fwrite(fileData.data(),(size_t)fileData.length(),1,msi) != 1)) {
-						fclose(msi);
-						return;
-					}
-					fclose(msi);
-					FILE *bat = fopen(batp,"wb");
-					if (!bat)
-						return;
-					fprintf(bat,
-						"TIMEOUT.EXE /T 1 /NOBREAK\r\n"
-						"NET.EXE STOP \"ZeroTierOneService\"\r\n"
-						"TIMEOUT.EXE /T 1 /NOBREAK\r\n"
-						"MSIEXEC.EXE /i \"%s\" /qn\r\n"
-						"TIMEOUT.EXE /T 1 /NOBREAK\r\n"
-						"NET.EXE START \"ZeroTierOneService\"\r\n"
-						"DEL \"%s\"\r\n"
-						"DEL \"%s\"\r\n",
-						msip,
-						msip,
-						batp);
-					fclose(bat);
-					STARTUPINFOA si;
-					PROCESS_INFORMATION pi;
-					memset(&si,0,sizeof(si));
-					memset(&pi,0,sizeof(pi));
-					Utils::snprintf(cmdline,sizeof(cmdline),"CMD.EXE /c \"%s\"",batp);
-					CreateProcessA(NULL,cmdline,NULL,NULL,FALSE,CREATE_NO_WINDOW|CREATE_NEW_PROCESS_GROUP,NULL,NULL,&si,&pi);
-				}
-#endif // __WINDOWS__
-
-				/* --------------------------------------------------------------- */
-
-				return;
-			} // else try to fetch from next IP address
-		}
-	}
-
-	void threadMain()
-		throw()
-	{
-		try {
-			this->doUpdateCheck();
-		} catch ( ... ) {}
-	}
-};
-static BackgroundSoftwareUpdateChecker backgroundSoftwareUpdateChecker;
-#endif // ZT_AUTO_UPDATE
 
 static std::string _trimString(const std::string &s)
 {
@@ -517,6 +263,8 @@ public:
 	EmbeddedNetworkController *_controller;
 	Phy<OneServiceImpl *> _phy;
 	Node *_node;
+	SoftwareUpdater *_updater;
+	bool _updateAutoApply;
 	unsigned int _primaryPort;
 
 	// Local configuration and memo-ized static path definitions
@@ -619,6 +367,8 @@ public:
 		,_controller((EmbeddedNetworkController *)0)
 		,_phy(this,false,true)
 		,_node((Node *)0)
+		,_updater((SoftwareUpdater *)0)
+		,_updateAutoApply(false)
 		,_primaryPort(port)
 		,_controlPlane((ControlPlane *)0)
 		,_lastDirectReceiveFromGlobal(0)
@@ -743,7 +493,7 @@ public:
 				std::string lcbuf;
 				if (OSUtils::readFile((_homePath + ZT_PATH_SEPARATOR_S + "local.conf").c_str(),lcbuf)) {
 					try {
-						_localConfig = json::parse(lcbuf);
+						_localConfig = OSUtils::jsonParse(lcbuf);
 						if (!_localConfig.is_object()) {
 							fprintf(stderr,"WARNING: unable to parse local.conf (root element is not a JSON object)" ZT_EOL_S);
 						}
@@ -756,11 +506,11 @@ public:
 				json &physical = _localConfig["physical"];
 				if (physical.is_object()) {
 					for(json::iterator phy(physical.begin());phy!=physical.end();++phy) {
-						InetAddress net(_jS(phy.key(),""));
+						InetAddress net(OSUtils::jsonString(phy.key(),""));
 						if (net) {
 							if (phy.value().is_object()) {
 								uint64_t tpid;
-								if ((tpid = _jI(phy.value()["trustedPathId"],0ULL)) != 0ULL) {
+								if ((tpid = OSUtils::jsonInt(phy.value()["trustedPathId"],0ULL)) != 0ULL) {
 									if ( ((net.ss_family == AF_INET)||(net.ss_family == AF_INET6)) && (trustedPathCount < ZT_MAX_TRUSTED_PATHS) && (net.ipScope() != InetAddress::IP_SCOPE_GLOBAL) && (net.netmaskBits() > 0) ) {
 										trustedPathIds[trustedPathCount] = tpid;
 										trustedPathNetworks[trustedPathCount] = net;
@@ -946,10 +696,8 @@ public:
 			uint64_t lastTapMulticastGroupCheck = 0;
 			uint64_t lastTcpFallbackResolve = 0;
 			uint64_t lastBindRefresh = 0;
-			uint64_t lastLocalInterfaceAddressCheck = (OSUtils::now() - ZT_LOCAL_INTERFACE_CHECK_INTERVAL) + 15000; // do this in 15s to give portmapper time to configure and other things time to settle
-#ifdef ZT_AUTO_UPDATE
-			uint64_t lastSoftwareUpdateCheck = 0;
-#endif // ZT_AUTO_UPDATE
+			uint64_t lastUpdateCheck = clockShouldBe;
+			uint64_t lastLocalInterfaceAddressCheck = (clockShouldBe - ZT_LOCAL_INTERFACE_CHECK_INTERVAL) + 15000; // do this in 15s to give portmapper time to configure and other things time to settle
 			for(;;) {
 				_run_m.lock();
 				if (!_run) {
@@ -969,6 +717,13 @@ public:
 				if ((now > clockShouldBe)&&((now - clockShouldBe) > 10000)) {
 					_lastRestart = now;
 					restarted = true;
+				}
+
+				// Check for updates (if enabled)
+				if ((_updater)&&((now - lastUpdateCheck) > 10000)) {
+					lastUpdateCheck = now;
+					if (_updater->check(now) && _updateAutoApply)
+						_updater->apply();
 				}
 
 				// Refresh bindings in case device's interfaces have changed, and also sync routes to update any shadow routes (e.g. shadow default)
@@ -993,13 +748,6 @@ public:
 					_node->processBackgroundTasks(now,&_nextBackgroundTaskDeadline);
 					dl = _nextBackgroundTaskDeadline;
 				}
-
-#ifdef ZT_AUTO_UPDATE
-				if ((now - lastSoftwareUpdateCheck) >= ZT_AUTO_UPDATE_CHECK_PERIOD) {
-					lastSoftwareUpdateCheck = now;
-					Thread::start(&backgroundSoftwareUpdateChecker);
-				}
-#endif // ZT_AUTO_UPDATE
 
 				if ((now - lastTcpFallbackResolve) >= ZT_TCP_FALLBACK_RERESOLVE_DELAY) {
 					lastTcpFallbackResolve = now;
@@ -1070,6 +818,8 @@ public:
 
 		delete _controlPlane;
 		_controlPlane = (ControlPlane *)0;
+		delete _updater;
+		_updater = (SoftwareUpdater *)0;
 		delete _node;
 		_node = (Node *)0;
 
@@ -1163,7 +913,7 @@ public:
 				if ((nstr.length() == ZT_ADDRESS_LENGTH_HEX)&&(v.value().is_object())) {
 					const Address ztaddr(nstr.c_str());
 					if (ztaddr) {
-						const std::string rstr(_jS(v.value()["role"],""));
+						const std::string rstr(OSUtils::jsonString(v.value()["role"],""));
 						_node->setRole(ztaddr.toInt(),((rstr == "upstream")||(rstr == "UPSTREAM")) ? ZT_PEER_ROLE_UPSTREAM : ZT_PEER_ROLE_LEAF);
 
 						const uint64_t ztaddr2 = ztaddr.toInt();
@@ -1175,7 +925,7 @@ public:
 						json &tryAddrs = v.value()["try"];
 						if (tryAddrs.is_array()) {
 							for(unsigned long i=0;i<tryAddrs.size();++i) {
-								const InetAddress ip(_jS(tryAddrs[i],""));
+								const InetAddress ip(OSUtils::jsonString(tryAddrs[i],""));
 								if (ip.ss_family == AF_INET)
 									v4h.push_back(ip);
 								else if (ip.ss_family == AF_INET6)
@@ -1185,7 +935,7 @@ public:
 						json &blAddrs = v.value()["blacklist"];
 						if (blAddrs.is_array()) {
 							for(unsigned long i=0;i<blAddrs.size();++i) {
-								const InetAddress ip(_jS(tryAddrs[i],""));
+								const InetAddress ip(OSUtils::jsonString(tryAddrs[i],""));
 								if (ip.ss_family == AF_INET)
 									v4b.push_back(ip);
 								else if (ip.ss_family == AF_INET6)
@@ -1207,10 +957,10 @@ public:
 		json &physical = _localConfig["physical"];
 		if (physical.is_object()) {
 			for(json::iterator phy(physical.begin());phy!=physical.end();++phy) {
-				const InetAddress net(_jS(phy.key(),""));
+				const InetAddress net(OSUtils::jsonString(phy.key(),""));
 				if ((net)&&(net.netmaskBits() > 0)) {
 					if (phy.value().is_object()) {
-						if (_jB(phy.value()["blacklist"],false)) {
+						if (OSUtils::jsonBool(phy.value()["blacklist"],false)) {
 							if (net.ss_family == AF_INET)
 								_globalV4Blacklist.push_back(net);
 							else if (net.ss_family == AF_INET6)
@@ -1225,17 +975,31 @@ public:
 		_interfacePrefixBlacklist.clear();
 		json &settings = _localConfig["settings"];
 		if (settings.is_object()) {
-			const std::string rp(_jS(settings["relayPolicy"],""));
+			const std::string rp(OSUtils::jsonString(settings["relayPolicy"],""));
 			if ((rp == "always")||(rp == "ALWAYS"))
 				_node->setRelayPolicy(ZT_RELAY_POLICY_ALWAYS);
 			else if ((rp == "never")||(rp == "NEVER"))
 				_node->setRelayPolicy(ZT_RELAY_POLICY_NEVER);
 			else _node->setRelayPolicy(ZT_RELAY_POLICY_TRUSTED);
 
+			const std::string up(OSUtils::jsonString(settings["softwareUpdate"],ZT_SOFTWARE_UPDATE_DEFAULT));
+			const bool udist = OSUtils::jsonBool(settings["softwareUpdateDist"],false);
+			if (((up == "apply")||(up == "download"))||(udist)) {
+				if (!_updater)
+					_updater = new SoftwareUpdater(*_node,_homePath);
+				_updateAutoApply = (up == "apply");
+				_updater->setUpdateDistribution(udist);
+				_updater->setChannel(OSUtils::jsonString(settings["softwareUpdateChannel"],ZT_SOFTWARE_UPDATE_DEFAULT_CHANNEL));
+			} else {
+				delete _updater;
+				_updater = (SoftwareUpdater *)0;
+				_updateAutoApply = false;
+			}
+
 			json &ignoreIfs = settings["interfacePrefixBlacklist"];
 			if (ignoreIfs.is_array()) {
 				for(unsigned long i=0;i<ignoreIfs.size();++i) {
-					const std::string tmp(_jS(ignoreIfs[i],""));
+					const std::string tmp(OSUtils::jsonString(ignoreIfs[i],""));
 					if (tmp.length() > 0)
 						_interfacePrefixBlacklist.push_back(tmp);
 				}
@@ -1244,7 +1008,7 @@ public:
 			json &amf = settings["allowManagementFrom"];
 			if (amf.is_array()) {
 				for(unsigned long i=0;i<amf.size();++i) {
-					const InetAddress nw(_jS(amf[i],""));
+					const InetAddress nw(OSUtils::jsonString(amf[i],""));
 					if (nw)
 						_allowManagementFrom.push_back(nw);
 				}
@@ -1666,6 +1430,16 @@ public:
 			case ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_CONFIG_UPDATE:
 				memcpy(&(n.config),nwc,sizeof(ZT_VirtualNetworkConfig));
 				if (n.tap) { // sanity check
+#ifdef __WINDOWS__
+                    // wait for up to 5 seconds for the WindowsEthernetTap to actually be initialized
+                    // 
+                    // without WindowsEthernetTap::isInitialized() returning true, the won't actually
+                    // be online yet and setting managed routes on it will fail.
+                    const int MAX_SLEEP_COUNT = 500;
+                    for (int i = 0; !n.tap->isInitialized() && i < MAX_SLEEP_COUNT; i++) {
+                        Sleep(10);
+                    }
+#endif
 					syncManagedStuff(n,true,true);
 				} else {
 					_nets.erase(nwid);
@@ -1714,6 +1488,13 @@ public:
 				if (metaData) {
 					::fprintf(stderr,"%s" ZT_EOL_S,(const char *)metaData);
 					::fflush(stderr);
+				}
+			}	break;
+
+			case ZT_EVENT_USER_MESSAGE: {
+				const ZT_UserMessage *um = reinterpret_cast<const ZT_UserMessage *>(metaData);
+				if ((um->typeId == ZT_SOFTWARE_UPDATE_USER_MESSAGE_TYPE)&&(_updater)) {
+					_updater->handleSoftwareUpdateUserMessage(um->origin,um->data,um->length);
 				}
 			}	break;
 
@@ -2233,30 +2014,6 @@ static int ShttpOnMessageComplete(http_parser *parser)
 std::string OneService::platformDefaultHomePath()
 {
 	return OSUtils::platformDefaultHomePath();
-}
-
-std::string OneService::autoUpdateUrl()
-{
-#ifdef ZT_AUTO_UPDATE
-
-/*
-#if defined(__LINUX__) && ( defined(__i386__) || defined(__x86_64) || defined(__x86_64__) || defined(__amd64) || defined(__i386) )
-	if (sizeof(void *) == 8)
-		return "http://download.zerotier.com/ZeroTierOneInstaller-linux-x64-LATEST.nfo";
-	else return "http://download.zerotier.com/ZeroTierOneInstaller-linux-x86-LATEST.nfo";
-#endif
-*/
-
-#if defined(__APPLE__) && ( defined(__i386__) || defined(__x86_64) || defined(__x86_64__) || defined(__amd64) || defined(__i386) )
-	return "http://download.zerotier.com/update/mac_intel/";
-#endif
-
-#ifdef __WINDOWS__
-	return "http://download.zerotier.com/update/win_intel/";
-#endif
-
-#endif // ZT_AUTO_UPDATE
-	return std::string();
 }
 
 OneService *OneService::newInstance(const char *hp,unsigned int port) { return new OneServiceImpl(hp,port); }
